@@ -19,11 +19,40 @@ import { DEFAULT_GATE_CONFIG } from "./gate";
 import { v4 as uuidv4 } from "uuid";
 
 // ─────────────────────────────────────────────
+// GLOBAL SINGLETON
+//
+// Next.js dev mode and serverless runtimes can instantiate a module multiple
+// times (per route, per request). Hanging the store off globalThis guarantees
+// a single shared instance across all route handlers within one process.
+//
+// In production this is replaced entirely by Supabase — globalThis is only
+// a dev/preview convenience.
+// ─────────────────────────────────────────────
+
+type StoreGlobal = {
+  sessions: Map<string, SundialSession>;
+  activeGateConfig: GateConfig;
+  creditUsage: CreditUsageEntry[];
+};
+
+const g = globalThis as unknown as { __sundialStore?: StoreGlobal };
+
+if (!g.__sundialStore) {
+  g.__sundialStore = {
+    sessions: new Map<string, SundialSession>(),
+    activeGateConfig: { ...DEFAULT_GATE_CONFIG },
+    creditUsage: [],
+  };
+}
+
+const store = g.__sundialStore;
+
+// ─────────────────────────────────────────────
 // SESSIONS STORE
 // Map<session_id, SundialSession>
 // ─────────────────────────────────────────────
 
-const sessions = new Map<string, SundialSession>();
+const sessions = store.sessions;
 
 export function getSession(id: string): SundialSession | undefined {
   return sessions.get(id);
@@ -63,19 +92,17 @@ export function getRecentSessions(limit = 20): SundialSession[] {
 // Single active config — admin can update at runtime
 // ─────────────────────────────────────────────
 
-let activeGateConfig: GateConfig = { ...DEFAULT_GATE_CONFIG };
-
 export function getGateConfig(): GateConfig {
-  return activeGateConfig;
+  return store.activeGateConfig;
 }
 
 export function setGateConfig(config: GateConfig): GateConfig {
   const updated = {
     ...config,
-    version: activeGateConfig.version + 1,
+    version: store.activeGateConfig.version + 1,
     updated_at: new Date().toISOString(),
   };
-  activeGateConfig = updated;
+  store.activeGateConfig = updated;
   return updated;
 }
 
@@ -84,7 +111,7 @@ export function setGateConfig(config: GateConfig): GateConfig {
 // Append-only log of Aurora API calls
 // ─────────────────────────────────────────────
 
-const creditUsage: CreditUsageEntry[] = [];
+const creditUsage = store.creditUsage;
 
 export function logCreditUsage(
   entry: Omit<CreditUsageEntry, "id" | "timestamp">
