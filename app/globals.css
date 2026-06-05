@@ -237,6 +237,23 @@ select.input-dark {
   100% { opacity: 1; transform: translateY(0); }
 }
 
+/* Realtime row flash — used in the admin dashboard when a row gets
+   inserted or updated via Supabase Realtime. */
+.sundial-row-hot > td {
+  animation: sundialRowFlash 1.5s ease-out;
+}
+
+@keyframes sundialRowFlash {
+  0% {
+    background-color: rgba(245, 158, 11, 0.25);
+    box-shadow: inset 2px 0 0 #f59e0b;
+  }
+  100% {
+    background-color: transparent;
+    box-shadow: inset 2px 0 0 transparent;
+  }
+}
+
 /* Scrollbar */
 ::-webkit-scrollbar {
   width: 6px;

@@ -15,7 +15,7 @@
  * TODO: Subscribe to Supabase Realtime for live session updates
  */
 
-import { useState, useEffect, useCallback } from "react";
+import { useState, useEffect, useCallback, useRef } from "react";
 import type {
   GateConfig,
   GateRule,
@@ -24,6 +24,39 @@ import type {
   CreditUsageEntry,
   RuleOperator,
 } from "@/lib/types";
+import { useSundialRealtime, type RealtimeStatus } from "@/lib/use-sundial-realtime";
+
+// Map a raw Realtime row payload to our app-level types. The DB and the
+// app types are almost identical — we just normalize null → undefined.
+function realtimeRowToSession(r: Record<string, unknown>): SundialSession {
+  return {
+    id: r.id as string,
+    intake: r.intake as SundialSession["intake"],
+    gate_evaluation: r.gate_evaluation as SundialSession["gate_evaluation"],
+    gate_config_version: r.gate_config_version as number,
+    status: r.status as SundialSession["status"],
+    aurora_project: (r.aurora_project ?? undefined) as SundialSession["aurora_project"],
+    aurora_design: (r.aurora_design ?? undefined) as SundialSession["aurora_design"],
+    aurora_pricing: (r.aurora_pricing ?? undefined) as SundialSession["aurora_pricing"],
+    aurora_financing: (r.aurora_financing ?? undefined) as SundialSession["aurora_financing"],
+    aurora_proposal: (r.aurora_proposal ?? undefined) as SundialSession["aurora_proposal"],
+    proposal_url: (r.proposal_url ?? undefined) as string | undefined,
+    error_message: (r.error_message ?? undefined) as string | undefined,
+    created_at: r.created_at as string,
+    updated_at: r.updated_at as string,
+  };
+}
+
+function realtimeRowToUsage(r: Record<string, unknown>): CreditUsageEntry {
+  return {
+    id: r.id as string,
+    session_id: (r.session_id ?? "") as string,
+    call_type: r.call_type as CreditUsageEntry["call_type"],
+    cost_usd: Number(r.cost_usd),
+    success: r.success as boolean,
+    timestamp: r.timestamp as string,
+  };
+}
 
 // ─────────────────────────────────────────────
 // AUTH LAYER
@@ -116,6 +149,35 @@ export default function AdminPage() {
   const [loading, setLoading] = useState(false);
   const [saveStatus, setSaveStatus] = useState<"idle" | "saving" | "saved" | "error">("idle");
 
+  // Realtime: track recently-changed row IDs for flash animation.
+  // We clear the set 1.5s after each change.
+  const [hotSessionIds, setHotSessionIds] = useState<Set<string>>(new Set());
+  const [hotUsageIds, setHotUsageIds] = useState<Set<string>>(new Set());
+  const hotTimersRef = useRef<Map<string, ReturnType<typeof setTimeout>>>(new Map());
+
+  const markHot = useCallback(
+    (id: string, setter: (updater: (s: Set<string>) => Set<string>) => void) => {
+      setter((prev) => {
+        const next = new Set(prev);
+        next.add(id);
+        return next;
+      });
+      // Clear after 1500ms
+      const existing = hotTimersRef.current.get(id);
+      if (existing) clearTimeout(existing);
+      const timer = setTimeout(() => {
+        setter((prev) => {
+          const next = new Set(prev);
+          next.delete(id);
+          return next;
+        });
+        hotTimersRef.current.delete(id);
+      }, 1500);
+      hotTimersRef.current.set(id, timer);
+    },
+    []
+  );
+
   // Test panel
   const [testJson, setTestJson] = useState(JSON.stringify({
     state: "TX",
@@ -154,11 +216,63 @@ export default function AdminPage() {
   useEffect(() => {
     if (authed) {
       fetchDashboard();
-      // Auto-refresh every 30 seconds
-      const interval = setInterval(fetchDashboard, 30_000);
+      // Polling fallback in case Realtime drops. Cadence is long because
+      // Realtime drives most updates now.
+      const interval = setInterval(fetchDashboard, 60_000);
       return () => clearInterval(interval);
     }
   }, [authed, fetchDashboard]);
+
+  // ── Realtime subscriptions ──────────────────────────────
+  const realtimeStatus: RealtimeStatus = useSundialRealtime({
+    enabled: authed,
+    onSessionInsert: (row) => {
+      const session = realtimeRowToSession(row);
+      setSessions((prev) => {
+        // Skip if already in list (race with initial fetch)
+        if (prev.find((s) => s.id === session.id)) return prev;
+        return [session, ...prev].slice(0, 20);
+      });
+      markHot(session.id, setHotSessionIds);
+    },
+    onSessionUpdate: (row) => {
+      const session = realtimeRowToSession(row);
+      setSessions((prev) => {
+        const idx = prev.findIndex((s) => s.id === session.id);
+        if (idx === -1) return [session, ...prev].slice(0, 20);
+        const next = [...prev];
+        next[idx] = session;
+        return next;
+      });
+      markHot(session.id, setHotSessionIds);
+    },
+    onUsageInsert: (row) => {
+      const entry = realtimeRowToUsage(row);
+      setCreditUsage((prev) => {
+        if (prev.find((u) => u.id === entry.id)) return prev;
+        return [entry, ...prev].slice(0, 50);
+      });
+      // Optimistically bump the today/month counters. The next poll will
+      // correct any drift.
+      const ts = new Date(entry.timestamp);
+      const now = new Date();
+      const sameDay =
+        ts.getFullYear() === now.getFullYear() &&
+        ts.getMonth() === now.getMonth() &&
+        ts.getDate() === now.getDate();
+      const sameMonth =
+        ts.getFullYear() === now.getFullYear() &&
+        ts.getMonth() === now.getMonth();
+      if (sameDay) setTodaySpend((v) => v + entry.cost_usd);
+      if (sameMonth) setMonthSpend((v) => v + entry.cost_usd);
+      markHot(entry.id, setHotUsageIds);
+    },
+    onGateConfigInsert: (row) => {
+      // Someone else (or another tab) saved a new gate config version.
+      // Just refetch — simpler than mapping the JSONB rules ourselves.
+      fetchDashboard();
+    },
+  });
 
   const handleSaveConfig = async () => {
     if (!config) return;
@@ -225,12 +339,13 @@ export default function AdminPage() {
         <div className="flex items-center justify-between mb-6">
           <div>
             <div className="flex items-center gap-3">
-              <div className="w-2 h-2 rounded-full bg-green-400 animate-pulse" />
+              <LiveStatusDot status={realtimeStatus} />
               <h1 className="text-lg font-bold text-slate-100">Sundial Admin</h1>
               <span className="badge badge-gray">Internal</span>
             </div>
             <p className="text-xs text-slate-500 mt-0.5">
-              Gate Config v{config?.version ?? "—"} · Victory Energy
+              Gate Config v{config?.version ?? "—"} · Victory Energy ·{" "}
+              <LiveStatusLabel status={realtimeStatus} />
             </p>
           </div>
           <div className="flex items-center gap-3">
@@ -289,10 +404,11 @@ export default function AdminPage() {
               dailyCap={config?.daily_credit_cap_usd ?? 200}
               monthlyCap={config?.monthly_credit_cap_usd ?? 2000}
               usage={creditUsage}
+              hotIds={hotUsageIds}
             />
           )}
           {activeTab === "sessions" && (
-            <SessionsTable sessions={sessions} />
+            <SessionsTable sessions={sessions} hotIds={hotSessionIds} />
           )}
           {activeTab === "test" && (
             <TestPanel
@@ -579,12 +695,14 @@ function CreditUsageDashboard({
   dailyCap,
   monthlyCap,
   usage,
+  hotIds,
 }: {
   todaySpend: number;
   monthSpend: number;
   dailyCap: number;
   monthlyCap: number;
   usage: CreditUsageEntry[];
+  hotIds: Set<string>;
 }) {
   const dailyPct = Math.min(100, (todaySpend / dailyCap) * 100);
   const monthlyPct = Math.min(100, (monthSpend / monthlyCap) * 100);
@@ -655,7 +773,10 @@ function CreditUsageDashboard({
                 <tr><td colSpan={5} className="text-center text-slate-600 py-4">No API calls yet — submit a quote to see usage</td></tr>
               )}
               {usage.map((entry) => (
-                <tr key={entry.id}>
+                <tr
+                  key={entry.id}
+                  className={hotIds.has(entry.id) ? "sundial-row-hot" : undefined}
+                >
                   <td className="font-mono text-[10px]">
                     {new Date(entry.timestamp).toLocaleTimeString()}
                   </td>
@@ -724,7 +845,7 @@ function CapGauge({
 // SESSIONS TABLE
 // ─────────────────────────────────────────────
 
-function SessionsTable({ sessions }: { sessions: SundialSession[] }) {
+function SessionsTable({ sessions, hotIds }: { sessions: SundialSession[]; hotIds: Set<string> }) {
   const STATUS_BADGE: Record<string, string> = {
     intake: "badge-gray",
     designing: "badge-blue",
@@ -758,7 +879,10 @@ function SessionsTable({ sessions }: { sessions: SundialSession[] }) {
               <tr><td colSpan={8} className="text-center text-slate-600 py-4">No sessions yet</td></tr>
             )}
             {sessions.map((s) => (
-              <tr key={s.id}>
+              <tr
+                key={s.id}
+                className={hotIds.has(s.id) ? "sundial-row-hot" : undefined}
+              >
                 <td className="font-mono text-[10px] text-slate-500">{s.id.slice(0, 8)}…</td>
                 <td>{s.intake.first} {s.intake.last}</td>
                 <td className="text-[10px]">{s.intake.city}, {s.intake.state}</td>
@@ -937,6 +1061,42 @@ function KpiCard({
       {sub && <div className="text-[10px] text-slate-600 mt-0.5">{sub}</div>}
     </div>
   );
+}
+
+// Live realtime connection indicator (replaces the static green dot).
+function LiveStatusDot({ status }: { status: RealtimeStatus }) {
+  const styles: Record<RealtimeStatus, { color: string; pulse: boolean }> = {
+    live: { color: "bg-green-400", pulse: true },
+    connecting: { color: "bg-amber-400", pulse: true },
+    reconnecting: { color: "bg-orange-400", pulse: true },
+    error: { color: "bg-red-400", pulse: false },
+    disabled: { color: "bg-slate-600", pulse: false },
+  };
+  const s = styles[status];
+  return (
+    <div
+      className={`w-2 h-2 rounded-full ${s.color} ${s.pulse ? "animate-pulse" : ""}`}
+      title={`Realtime: ${status}`}
+    />
+  );
+}
+
+function LiveStatusLabel({ status }: { status: RealtimeStatus }) {
+  const text: Record<RealtimeStatus, string> = {
+    live: "Live",
+    connecting: "Connecting…",
+    reconnecting: "Reconnecting…",
+    error: "Realtime error",
+    disabled: "Realtime off (polling)",
+  };
+  const color: Record<RealtimeStatus, string> = {
+    live: "text-green-400",
+    connecting: "text-amber-400",
+    reconnecting: "text-orange-400",
+    error: "text-red-400",
+    disabled: "text-slate-500",
+  };
+  return <span className={color[status]}>{text[status]}</span>;
 }
 
 // Helper: read cookie by name (client-side)
