@@ -4,9 +4,6 @@
  * GET /api/proposal/[designId]
  *   Finds the session containing this design ID and returns full session data
  *   for rendering the proposal page.
- *
- * TODO: Replace with Supabase query:
- *   SELECT * FROM sundial_sessions WHERE aurora_design->>'id' = $1
  */
 
 import { NextRequest, NextResponse } from "next/server";
@@ -22,9 +19,10 @@ export async function GET(
     return NextResponse.json({ error: "Design ID required" }, { status: 400 });
   }
 
-  // Search sessions for one that contains this design ID
-  // TODO: Replace with efficient DB lookup — this linear scan doesn't scale
-  const sessions = getAllSessions();
+  // Linear scan over recent sessions — fine for the mock pipeline volume.
+  // TODO: When we move to real Aurora volume, add a Postgres expression
+  //       index on (aurora_design->>'id') and query directly via Supabase.
+  const sessions = await getAllSessions();
   const session = sessions.find(
     (s) => s.aurora_design?.id === designId || s.aurora_proposal?.design_id === designId
   );

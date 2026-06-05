@@ -32,8 +32,23 @@ export async function GET(req: NextRequest) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 
-  const config = getGateConfig();
-  const sessions = getRecentSessions(20);
+  const [
+    config,
+    sessions,
+    creditToday,
+    creditMonth,
+    recentUsage,
+    todayUsage,
+    monthUsage,
+  ] = await Promise.all([
+    getGateConfig(),
+    getRecentSessions(20),
+    getTodaySpendUsd(),
+    getMonthSpendUsd(),
+    getRecentCreditUsage(50),
+    getCreditUsageToday(),
+    getCreditUsageThisMonth(),
+  ]);
 
   // Calculate gate pass rate today
   const todaySessions = sessions.filter((s) => {
@@ -55,15 +70,15 @@ export async function GET(req: NextRequest) {
     success: true,
     data: {
       gate_config: config,
-      credit_usage_today_usd: getTodaySpendUsd(),
-      credit_usage_month_usd: getMonthSpendUsd(),
-      recent_usage: getRecentCreditUsage(50),
+      credit_usage_today_usd: creditToday,
+      credit_usage_month_usd: creditMonth,
+      recent_usage: recentUsage,
       recent_sessions: sessions,
       total_sessions_today: todaySessions.length,
       total_sessions_month: sessions.length, // Approximate (last 20 sessions)
       gate_pass_rate_today: gatePassRateToday,
-      today_usage_entries: getCreditUsageToday().length,
-      month_usage_entries: getCreditUsageThisMonth().length,
+      today_usage_entries: todayUsage.length,
+      month_usage_entries: monthUsage.length,
     },
   });
 }

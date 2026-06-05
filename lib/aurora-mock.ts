@@ -101,6 +101,9 @@ async function mockApiCall<T>(
 
   const result = resultFn();
 
+  // Fire-and-forget credit log — we don't want a DB hiccup to fail the
+  // pipeline. logCreditUsage already swallows its own errors, but we still
+  // attach a .catch in case the Promise itself rejects for any reason.
   // TODO: Replace with real Aurora API call. Remove this mock log.
   logCreditUsage({
     session_id: sessionId,
@@ -109,7 +112,7 @@ async function mockApiCall<T>(
     project_id: projectId,
     design_id: designId,
     success: true,
-  });
+  }).catch((e) => console.error("[aurora-mock] credit log failed:", e));
 
   return result;
 }

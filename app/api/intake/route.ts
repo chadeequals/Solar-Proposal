@@ -38,11 +38,13 @@ export async function POST(req: NextRequest) {
     const sessionId = body.session_id || uuidv4();
 
     // Load current gate config
-    const gateConfig = getGateConfig();
+    const gateConfig = await getGateConfig();
 
     // Check current credit usage for cap enforcement
-    const todaySpend = getTodaySpendUsd();
-    const monthSpend = getMonthSpendUsd();
+    const [todaySpend, monthSpend] = await Promise.all([
+      getTodaySpendUsd(),
+      getMonthSpendUsd(),
+    ]);
 
     // Evaluate gate
     const gateEval = evaluateGate(body, gateConfig, todaySpend, monthSpend);
@@ -59,8 +61,7 @@ export async function POST(req: NextRequest) {
     };
 
     // Save session immediately so status polling works right away
-    // TODO: Replace with Supabase insert
-    setSession(session);
+    await setSession(session);
 
     if (!gateEval.should_trigger_aurora) {
       // Gate failed — save lead for manual follow-up
@@ -110,20 +111,21 @@ async function runAuroraPipelineAsync(sessionId: string, intake: Intake) {
     const result = await runFullAuroraPipeline(
       intake,
       (status, message) => {
-        // Update session status for polling
-        // TODO: With Supabase, this would update the DB row + trigger realtime
+        // Fire-and-forget progress update — don't block the pipeline on DB writes.
+        // Errors here are non-fatal: the final updateSession call below records
+        // the terminal state.
         updateSession(sessionId, {
           status: status as SundialSession["status"],
-          // Store progress message in error_message slot temporarily
-          // (repurposed as "progress" during pipeline — cleared on completion)
           error_message: undefined,
-        });
+        }).catch((e) =>
+          console.error(`[session ${sessionId}] progress update failed:`, e)
+        );
         console.log(`[session ${sessionId}] ${status}: ${message}`);
       }
     );
 
     // Pipeline complete — update session with all results
-    updateSession(sessionId, {
+    await updateSession(sessionId, {
       aurora_project: result.project,
       aurora_design: result.design,
       aurora_pricing: result.pricing,
@@ -138,9 +140,11 @@ async function runAuroraPipelineAsync(sessionId: string, intake: Intake) {
 
   } catch (err) {
     console.error(`[session ${sessionId}] Pipeline failed:`, err);
-    updateSession(sessionId, {
+    await updateSession(sessionId, {
       status: "error",
       error_message: err instanceof Error ? err.message : "Aurora pipeline failed",
-    });
+    }).catch((e) =>
+      console.error(`[session ${sessionId}] error-state write failed:`, e)
+    );
   }
 }

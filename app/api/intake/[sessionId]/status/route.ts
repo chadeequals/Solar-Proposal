@@ -38,8 +38,7 @@ export async function GET(
     );
   }
 
-  // TODO: Replace with Supabase query: SELECT * FROM sundial_sessions WHERE id = $1
-  const session = getSession(sessionId);
+  const session = await getSession(sessionId);
 
   if (!session) {
     return NextResponse.json(

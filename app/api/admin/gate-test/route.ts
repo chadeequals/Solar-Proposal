@@ -26,9 +26,11 @@ export async function POST(req: NextRequest) {
   try {
     const body = await req.json() as Partial<Intake>;
 
-    const config = getGateConfig();
-    const todaySpend = getTodaySpendUsd();
-    const monthSpend = getMonthSpendUsd();
+    const [config, todaySpend, monthSpend] = await Promise.all([
+      getGateConfig(),
+      getTodaySpendUsd(),
+      getMonthSpendUsd(),
+    ]);
 
     // Fill required fields with defaults for test purposes
     const testIntake: Intake = {

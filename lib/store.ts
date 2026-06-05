@@ -1,157 +1,345 @@
 /**
- * Sundial v2 — In-Memory Store
+ * Sundial v2 — Supabase-backed Store
  *
- * Provides session, config, and credit usage persistence during development.
- * All state lives in module-level Maps — survives across API calls in the
- * same Next.js server process but resets on server restart.
+ * Persists sessions, gate config (versioned), and Aurora credit usage to
+ * Supabase Postgres. All functions are async — callers must await.
  *
- * TODO: Replace each store with a Supabase table:
- *   - sessions        → table "sundial_sessions"
- *   - gate_config     → table "gate_configs" (versioned, latest row is active)
- *   - credit_usage    → table "aurora_credit_usage"
+ * Schema (see supabase/migrations):
+ *   - sundial_sessions       (id text PK, jsonb columns for intake/aurora/etc.)
+ *   - gate_configs           (versioned — highest version is active)
+ *   - aurora_credit_usage    (append-only log)
  *
- * TODO: Add Redis (Upstash) for credit cap enforcement to prevent race conditions
- *       under concurrent load
+ * TODO: Add Redis (Upstash) atomic counter for credit cap enforcement
+ *       to prevent race conditions under concurrent load. Right now two
+ *       simultaneous intakes near the cap could both pass.
  */
 
-import type { SundialSession, GateConfig, CreditUsageEntry } from "./types";
+import type { SundialSession, GateConfig, GateRule, CreditUsageEntry } from "./types";
 import { DEFAULT_GATE_CONFIG } from "./gate";
-import { v4 as uuidv4 } from "uuid";
+import { supabase } from "./supabase";
 
 // ─────────────────────────────────────────────
-// GLOBAL SINGLETON
-//
-// Next.js dev mode and serverless runtimes can instantiate a module multiple
-// times (per route, per request). Hanging the store off globalThis guarantees
-// a single shared instance across all route handlers within one process.
-//
-// In production this is replaced entirely by Supabase — globalThis is only
-// a dev/preview convenience.
+// SESSIONS
 // ─────────────────────────────────────────────
 
-type StoreGlobal = {
-  sessions: Map<string, SundialSession>;
-  activeGateConfig: GateConfig;
-  creditUsage: CreditUsageEntry[];
+type SessionRow = {
+  id: string;
+  intake: SundialSession["intake"];
+  gate_evaluation: SundialSession["gate_evaluation"];
+  gate_config_version: number;
+  status: SundialSession["status"];
+  aurora_project: SundialSession["aurora_project"] | null;
+  aurora_design: SundialSession["aurora_design"] | null;
+  aurora_pricing: SundialSession["aurora_pricing"] | null;
+  aurora_financing: SundialSession["aurora_financing"] | null;
+  aurora_proposal: SundialSession["aurora_proposal"] | null;
+  proposal_url: string | null;
+  error_message: string | null;
+  created_at: string;
+  updated_at: string;
 };
 
-const g = globalThis as unknown as { __sundialStore?: StoreGlobal };
-
-if (!g.__sundialStore) {
-  g.__sundialStore = {
-    sessions: new Map<string, SundialSession>(),
-    activeGateConfig: { ...DEFAULT_GATE_CONFIG },
-    creditUsage: [],
+function rowToSession(r: SessionRow): SundialSession {
+  return {
+    id: r.id,
+    intake: r.intake,
+    gate_evaluation: r.gate_evaluation,
+    gate_config_version: r.gate_config_version,
+    status: r.status,
+    aurora_project: r.aurora_project ?? undefined,
+    aurora_design: r.aurora_design ?? undefined,
+    aurora_pricing: r.aurora_pricing ?? undefined,
+    aurora_financing: r.aurora_financing ?? undefined,
+    aurora_proposal: r.aurora_proposal ?? undefined,
+    proposal_url: r.proposal_url ?? undefined,
+    error_message: r.error_message ?? undefined,
+    created_at: r.created_at,
+    updated_at: r.updated_at,
   };
 }
 
-const store = g.__sundialStore;
-
-// ─────────────────────────────────────────────
-// SESSIONS STORE
-// Map<session_id, SundialSession>
-// ─────────────────────────────────────────────
-
-const sessions = store.sessions;
-
-export function getSession(id: string): SundialSession | undefined {
-  return sessions.get(id);
+export async function getSession(id: string): Promise<SundialSession | undefined> {
+  const { data, error } = await supabase
+    .from("sundial_sessions")
+    .select("*")
+    .eq("id", id)
+    .maybeSingle();
+  if (error) {
+    console.error("[store] getSession error:", error.message);
+    return undefined;
+  }
+  return data ? rowToSession(data as SessionRow) : undefined;
 }
 
-export function setSession(session: SundialSession): void {
-  sessions.set(session.id, session);
+export async function setSession(session: SundialSession): Promise<void> {
+  const row = {
+    id: session.id,
+    intake: session.intake,
+    gate_evaluation: session.gate_evaluation,
+    gate_config_version: session.gate_config_version,
+    status: session.status,
+    aurora_project: session.aurora_project ?? null,
+    aurora_design: session.aurora_design ?? null,
+    aurora_pricing: session.aurora_pricing ?? null,
+    aurora_financing: session.aurora_financing ?? null,
+    aurora_proposal: session.aurora_proposal ?? null,
+    proposal_url: session.proposal_url ?? null,
+    error_message: session.error_message ?? null,
+    created_at: session.created_at,
+    updated_at: session.updated_at,
+  };
+  const { error } = await supabase.from("sundial_sessions").upsert(row);
+  if (error) {
+    console.error("[store] setSession error:", error.message);
+    throw new Error(`Failed to save session: ${error.message}`);
+  }
 }
 
-export function updateSession(
+export async function updateSession(
   id: string,
   updates: Partial<SundialSession>
-): SundialSession | null {
-  const existing = sessions.get(id);
-  if (!existing) return null;
-  const updated = {
-    ...existing,
-    ...updates,
-    updated_at: new Date().toISOString(),
+): Promise<SundialSession | null> {
+  // Only allow updating known columns. Strip id/created_at.
+  const allowed: Record<string, unknown> = {};
+  const keys: (keyof SundialSession)[] = [
+    "intake",
+    "gate_evaluation",
+    "gate_config_version",
+    "status",
+    "aurora_project",
+    "aurora_design",
+    "aurora_pricing",
+    "aurora_financing",
+    "aurora_proposal",
+    "proposal_url",
+    "error_message",
+  ];
+  for (const k of keys) {
+    if (k in updates) allowed[k] = updates[k] ?? null;
+  }
+  allowed.updated_at = new Date().toISOString();
+
+  const { data, error } = await supabase
+    .from("sundial_sessions")
+    .update(allowed)
+    .eq("id", id)
+    .select()
+    .maybeSingle();
+  if (error) {
+    console.error("[store] updateSession error:", error.message);
+    return null;
+  }
+  return data ? rowToSession(data as SessionRow) : null;
+}
+
+export async function getAllSessions(): Promise<SundialSession[]> {
+  const { data, error } = await supabase
+    .from("sundial_sessions")
+    .select("*")
+    .order("created_at", { ascending: false });
+  if (error) {
+    console.error("[store] getAllSessions error:", error.message);
+    return [];
+  }
+  return (data as SessionRow[]).map(rowToSession);
+}
+
+export async function getRecentSessions(limit = 20): Promise<SundialSession[]> {
+  const { data, error } = await supabase
+    .from("sundial_sessions")
+    .select("*")
+    .order("created_at", { ascending: false })
+    .limit(limit);
+  if (error) {
+    console.error("[store] getRecentSessions error:", error.message);
+    return [];
+  }
+  return (data as SessionRow[]).map(rowToSession);
+}
+
+// ─────────────────────────────────────────────
+// GATE CONFIG (versioned — latest row is active)
+// ─────────────────────────────────────────────
+
+type GateConfigRow = {
+  id: string;
+  version: number;
+  aurora_enabled: boolean;
+  trigger_step: number;
+  monthly_credit_cap_usd: number;
+  daily_credit_cap_usd: number;
+  fallback_action: GateConfig["fallback_action"];
+  lender_pre_qual_required: boolean;
+  rules: GateRule[];
+  updated_at: string;
+  updated_by: string | null;
+};
+
+function rowToGateConfig(r: GateConfigRow): GateConfig {
+  return {
+    version: r.version,
+    aurora_enabled: r.aurora_enabled,
+    trigger_step: r.trigger_step,
+    monthly_credit_cap_usd: Number(r.monthly_credit_cap_usd),
+    daily_credit_cap_usd: Number(r.daily_credit_cap_usd),
+    fallback_action: r.fallback_action,
+    lender_pre_qual_required: r.lender_pre_qual_required,
+    rules: r.rules,
+    updated_at: r.updated_at,
   };
-  sessions.set(id, updated);
-  return updated;
 }
 
-export function getAllSessions(): SundialSession[] {
-  return Array.from(sessions.values()).sort(
-    (a, b) => new Date(b.created_at).getTime() - new Date(a.created_at).getTime()
-  );
+export async function getGateConfig(): Promise<GateConfig> {
+  const { data, error } = await supabase
+    .from("gate_configs")
+    .select("*")
+    .order("version", { ascending: false })
+    .limit(1)
+    .maybeSingle();
+  if (error || !data) {
+    console.warn("[store] getGateConfig falling back to DEFAULT_GATE_CONFIG:", error?.message);
+    return { ...DEFAULT_GATE_CONFIG };
+  }
+  return rowToGateConfig(data as GateConfigRow);
 }
 
-export function getRecentSessions(limit = 20): SundialSession[] {
-  return getAllSessions().slice(0, limit);
-}
+export async function setGateConfig(config: GateConfig): Promise<GateConfig> {
+  // Find the latest version, increment, insert new row.
+  const { data: latest } = await supabase
+    .from("gate_configs")
+    .select("version")
+    .order("version", { ascending: false })
+    .limit(1)
+    .maybeSingle();
 
-// ─────────────────────────────────────────────
-// GATE CONFIG STORE
-// Single active config — admin can update at runtime
-// ─────────────────────────────────────────────
+  const newVersion = (latest?.version ?? 0) + 1;
 
-export function getGateConfig(): GateConfig {
-  return store.activeGateConfig;
-}
-
-export function setGateConfig(config: GateConfig): GateConfig {
-  const updated = {
-    ...config,
-    version: store.activeGateConfig.version + 1,
+  const row = {
+    version: newVersion,
+    aurora_enabled: config.aurora_enabled,
+    trigger_step: config.trigger_step,
+    monthly_credit_cap_usd: config.monthly_credit_cap_usd,
+    daily_credit_cap_usd: config.daily_credit_cap_usd,
+    fallback_action: config.fallback_action,
+    lender_pre_qual_required: config.lender_pre_qual_required,
+    rules: config.rules,
     updated_at: new Date().toISOString(),
+    updated_by: "admin",
   };
-  store.activeGateConfig = updated;
-  return updated;
+
+  const { data, error } = await supabase
+    .from("gate_configs")
+    .insert(row)
+    .select()
+    .single();
+  if (error) {
+    console.error("[store] setGateConfig error:", error.message);
+    throw new Error(`Failed to save gate config: ${error.message}`);
+  }
+  return rowToGateConfig(data as GateConfigRow);
 }
 
 // ─────────────────────────────────────────────
-// CREDIT USAGE STORE
-// Append-only log of Aurora API calls
+// CREDIT USAGE
 // ─────────────────────────────────────────────
 
-const creditUsage = store.creditUsage;
+type CreditUsageRow = {
+  id: string;
+  session_id: string | null;
+  call_type: string;
+  cost_usd: number;
+  success: boolean;
+  request_payload: unknown;
+  response_payload: unknown;
+  timestamp: string;
+};
 
-export function logCreditUsage(
+function rowToCreditUsage(r: CreditUsageRow): CreditUsageEntry {
+  return {
+    id: r.id,
+    session_id: r.session_id ?? "",
+    call_type: r.call_type as CreditUsageEntry["call_type"],
+    cost_usd: Number(r.cost_usd),
+    success: r.success,
+    timestamp: r.timestamp,
+  };
+}
+
+export async function logCreditUsage(
   entry: Omit<CreditUsageEntry, "id" | "timestamp">
-): CreditUsageEntry {
-  const full: CreditUsageEntry = {
-    ...entry,
-    id: uuidv4(),
+): Promise<CreditUsageEntry> {
+  const row = {
+    session_id: entry.session_id || null,
+    call_type: entry.call_type,
+    cost_usd: entry.cost_usd,
+    success: entry.success,
+    request_payload: null,
+    response_payload: null,
     timestamp: new Date().toISOString(),
   };
-  creditUsage.push(full);
-  return full;
+  const { data, error } = await supabase
+    .from("aurora_credit_usage")
+    .insert(row)
+    .select()
+    .single();
+  if (error) {
+    console.error("[store] logCreditUsage error:", error.message);
+    // Don't throw — credit logging failure shouldn't kill the pipeline
+    return {
+      id: "log-failed",
+      timestamp: row.timestamp,
+      ...entry,
+    };
+  }
+  return rowToCreditUsage(data as CreditUsageRow);
 }
 
-export function getCreditUsageToday(): CreditUsageEntry[] {
+async function getCreditUsageSince(since: Date): Promise<CreditUsageEntry[]> {
+  const { data, error } = await supabase
+    .from("aurora_credit_usage")
+    .select("*")
+    .eq("success", true)
+    .gte("timestamp", since.toISOString())
+    .order("timestamp", { ascending: false });
+  if (error) {
+    console.error("[store] getCreditUsageSince error:", error.message);
+    return [];
+  }
+  return (data as CreditUsageRow[]).map(rowToCreditUsage);
+}
+
+export async function getCreditUsageToday(): Promise<CreditUsageEntry[]> {
   const today = new Date();
   today.setHours(0, 0, 0, 0);
-  return creditUsage.filter(
-    (e) => e.success && new Date(e.timestamp) >= today
-  );
+  return getCreditUsageSince(today);
 }
 
-export function getCreditUsageThisMonth(): CreditUsageEntry[] {
+export async function getCreditUsageThisMonth(): Promise<CreditUsageEntry[]> {
   const startOfMonth = new Date();
   startOfMonth.setDate(1);
   startOfMonth.setHours(0, 0, 0, 0);
-  return creditUsage.filter(
-    (e) => e.success && new Date(e.timestamp) >= startOfMonth
-  );
+  return getCreditUsageSince(startOfMonth);
 }
 
-export function getTodaySpendUsd(): number {
-  return getCreditUsageToday().reduce((sum, e) => sum + e.cost_usd, 0);
+export async function getTodaySpendUsd(): Promise<number> {
+  const entries = await getCreditUsageToday();
+  return entries.reduce((sum, e) => sum + e.cost_usd, 0);
 }
 
-export function getMonthSpendUsd(): number {
-  return getCreditUsageThisMonth().reduce((sum, e) => sum + e.cost_usd, 0);
+export async function getMonthSpendUsd(): Promise<number> {
+  const entries = await getCreditUsageThisMonth();
+  return entries.reduce((sum, e) => sum + e.cost_usd, 0);
 }
 
-export function getRecentCreditUsage(limit = 50): CreditUsageEntry[] {
-  return [...creditUsage]
-    .sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime())
-    .slice(0, limit);
+export async function getRecentCreditUsage(limit = 50): Promise<CreditUsageEntry[]> {
+  const { data, error } = await supabase
+    .from("aurora_credit_usage")
+    .select("*")
+    .order("timestamp", { ascending: false })
+    .limit(limit);
+  if (error) {
+    console.error("[store] getRecentCreditUsage error:", error.message);
+    return [];
+  }
+  return (data as CreditUsageRow[]).map(rowToCreditUsage);
 }

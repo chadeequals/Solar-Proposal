@@ -25,8 +25,7 @@ export async function GET(req: NextRequest) {
     return NextResponse.json({ error: "Unauthorized" }, { status: 401 });
   }
 
-  // TODO: Replace with Supabase: SELECT * FROM gate_configs ORDER BY version DESC LIMIT 1
-  const config = getGateConfig();
+  const config = await getGateConfig();
   return NextResponse.json({ success: true, config });
 }
 
@@ -46,8 +45,8 @@ export async function POST(req: NextRequest) {
       );
     }
 
-    const currentConfig = getGateConfig();
-    const updated = setGateConfig({
+    const currentConfig = await getGateConfig();
+    const updated = await setGateConfig({
       ...currentConfig,
       ...body,
       // Ensure version is incremented by setGateConfig
