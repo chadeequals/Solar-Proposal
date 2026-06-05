@@ -139,7 +139,7 @@ function LoginScreen({ onLogin }: { onLogin: () => void }) {
 
 export default function AdminPage() {
   const [authed, setAuthed] = useState(false);
-  const [activeTab, setActiveTab] = useState<"gate" | "credits" | "sessions" | "test">("gate");
+  const [activeTab, setActiveTab] = useState<"gate" | "aurora" | "credits" | "sessions" | "test">("gate");
   const [config, setConfig] = useState<GateConfig | null>(null);
   const [sessions, setSessions] = useState<SundialSession[]>([]);
   const [creditUsage, setCreditUsage] = useState<CreditUsageEntry[]>([]);
@@ -327,6 +327,7 @@ export default function AdminPage() {
 
   const tabs = [
     { id: "gate" as const, label: "Gate Config" },
+    { id: "aurora" as const, label: "Aurora API" },
     { id: "credits" as const, label: "Credit Usage" },
     { id: "sessions" as const, label: "Sessions" },
     { id: "test" as const, label: "Test Panel" },
@@ -391,6 +392,14 @@ export default function AdminPage() {
         <div className="animate-fade-in">
           {activeTab === "gate" && config && (
             <GateConfigEditor
+              config={config}
+              onChange={setConfig}
+              onSave={handleSaveConfig}
+              saveStatus={saveStatus}
+            />
+          )}
+          {activeTab === "aurora" && config && (
+            <AuroraConfigEditor
               config={config}
               onChange={setConfig}
               onSave={handleSaveConfig}
@@ -870,13 +879,14 @@ function SessionsTable({ sessions, hotIds }: { sessions: SundialSession[]; hotId
               <th>Bill</th>
               <th>Gate</th>
               <th>Status</th>
+              <th>Aurora</th>
               <th>Proposal</th>
               <th>Created</th>
             </tr>
           </thead>
           <tbody>
             {sessions.length === 0 && (
-              <tr><td colSpan={8} className="text-center text-slate-600 py-4">No sessions yet</td></tr>
+              <tr><td colSpan={9} className="text-center text-slate-600 py-4">No sessions yet</td></tr>
             )}
             {sessions.map((s) => (
               <tr
@@ -898,6 +908,9 @@ function SessionsTable({ sessions, hotIds }: { sessions: SundialSession[]; hotId
                   <span className={`badge ${STATUS_BADGE[s.status] ?? "badge-gray"}`}>
                     {s.status.replace(/_/g, " ").toUpperCase()}
                   </span>
+                </td>
+                <td>
+                  <AuroraModePill mode={s.aurora_mode} fallbacks={s.aurora_fallback_calls} />
                 </td>
                 <td>
                   {s.proposal_url ? (
@@ -1104,4 +1117,234 @@ function getCookie(name: string): string | undefined {
   if (typeof document === "undefined") return undefined;
   const match = document.cookie.match(new RegExp(`(^| )${name}=([^;]+)`));
   return match ? match[2] : undefined;
+}
+
+// ─────────────────────────────────────────────
+// AURORA MODE PILL  (sessions table)
+// ─────────────────────────────────────────────
+
+function AuroraModePill({
+  mode,
+  fallbacks,
+}: {
+  mode?: "mock" | "real" | "partial";
+  fallbacks?: string[];
+}) {
+  const m = mode ?? "mock";
+  const cls: Record<string, string> = {
+    mock: "bg-slate-700/60 text-slate-300 border-slate-600/50",
+    real: "bg-green-600/20 text-green-300 border-green-500/40",
+    partial: "bg-amber-500/20 text-amber-300 border-amber-500/40",
+  };
+  const label = m.toUpperCase();
+  const title =
+    m === "partial" && fallbacks && fallbacks.length
+      ? `Fell back to mock for: ${fallbacks.join(", ")}`
+      : m === "real"
+      ? "All calls used real Aurora API"
+      : m === "mock"
+      ? "All calls used mock client"
+      : undefined;
+  return (
+    <span
+      title={title}
+      className={`inline-block px-1.5 py-0.5 rounded border text-[9px] font-mono font-bold tracking-wider ${cls[m]}`}
+    >
+      {label}
+    </span>
+  );
+}
+
+// ─────────────────────────────────────────────
+// AURORA CONFIG EDITOR  (new tab)
+// ─────────────────────────────────────────────
+
+function AuroraConfigEditor({
+  config,
+  onChange,
+  onSave,
+  saveStatus,
+}: {
+  config: GateConfig;
+  onChange: (c: GateConfig) => void;
+  onSave: () => void;
+  saveStatus: string;
+}) {
+  const [testing, setTesting] = useState(false);
+  const [testResult, setTestResult] = useState<{
+    ok: boolean;
+    configured: boolean;
+    message: string;
+    status?: number;
+  } | null>(null);
+
+  const emailsText = (config.aurora_allow_list_emails ?? []).join("\n");
+  const sessionIdsText = (config.aurora_allow_list_session_ids ?? []).join("\n");
+
+  const updateEmails = (text: string) => {
+    const list = text
+      .split("\n")
+      .map((s) => s.trim().toLowerCase())
+      .filter(Boolean);
+    onChange({ ...config, aurora_allow_list_emails: list });
+  };
+
+  const updateSessionIds = (text: string) => {
+    const list = text
+      .split("\n")
+      .map((s) => s.trim())
+      .filter(Boolean);
+    onChange({ ...config, aurora_allow_list_session_ids: list });
+  };
+
+  const handleTest = async () => {
+    setTesting(true);
+    setTestResult(null);
+    try {
+      const res = await fetch("/api/admin/aurora-test", { method: "POST" });
+      const data = await res.json();
+      setTestResult({
+        ok: !!data.success,
+        configured: !!data.configured,
+        message: data.message ?? (data.success ? "OK" : "Unknown error"),
+        status: data.status,
+      });
+    } catch (e) {
+      setTestResult({
+        ok: false,
+        configured: false,
+        message: e instanceof Error ? e.message : String(e),
+      });
+    } finally {
+      setTesting(false);
+    }
+  };
+
+  const masterOn = !!config.aurora_real_enabled;
+
+  return (
+    <div className="space-y-6">
+      {/* Master switch */}
+      <div className="card-navy p-5">
+        <h2 className="text-xs font-bold tracking-widest text-amber-500 uppercase mb-4">
+          Real Aurora API — Master Switch
+        </h2>
+        <div className="flex items-center justify-between p-4 rounded-lg bg-navy-900/60 border border-white/5">
+          <div className="pr-4">
+            <div className="text-sm font-semibold text-slate-200">
+              Enable real Aurora calls
+            </div>
+            <div className="text-xs text-slate-500 mt-1">
+              When ON, sessions matching the allow-list below hit the real Aurora API.
+              All other sessions stay on the mock client. When OFF, every session uses mock.
+            </div>
+            {masterOn && (
+              <div className="mt-2 text-[11px] text-amber-300 font-semibold">
+                Warning: real calls consume Aurora credits. Verify the allow-list before flipping.
+              </div>
+            )}
+          </div>
+          <button
+            onClick={() => onChange({ ...config, aurora_real_enabled: !masterOn })}
+            className={`relative w-14 h-7 rounded-full transition-colors flex-shrink-0 ${
+              masterOn ? "bg-green-500" : "bg-slate-700"
+            }`}
+          >
+            <span
+              className={`absolute top-1 left-1 w-5 h-5 rounded-full bg-white transition-transform ${
+                masterOn ? "translate-x-7" : ""
+              }`}
+            />
+          </button>
+        </div>
+      </div>
+
+      {/* Allow-list editors */}
+      <div className="card-navy p-5">
+        <h2 className="text-xs font-bold tracking-widest text-amber-500 uppercase mb-1">
+          Allow-list
+        </h2>
+        <p className="text-xs text-slate-500 mb-4">
+          Sessions matching ANY entry use the real Aurora API. Email matches are case-insensitive.
+          One value per line. Leave both empty to keep everyone on mock even when the master switch is on.
+        </p>
+        <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+          <div>
+            <label className="text-xs text-slate-400 uppercase tracking-wide font-semibold">
+              Emails ({(config.aurora_allow_list_emails ?? []).length})
+            </label>
+            <textarea
+              value={emailsText}
+              onChange={(e) => updateEmails(e.target.value)}
+              rows={8}
+              placeholder="chad@eequals.com&#10;test@example.com"
+              className="input-dark w-full mt-1 px-3 py-2 text-xs font-mono"
+              spellCheck={false}
+            />
+          </div>
+          <div>
+            <label className="text-xs text-slate-400 uppercase tracking-wide font-semibold">
+              Session IDs ({(config.aurora_allow_list_session_ids ?? []).length})
+            </label>
+            <textarea
+              value={sessionIdsText}
+              onChange={(e) => updateSessionIds(e.target.value)}
+              rows={8}
+              placeholder="abc12345-..."
+              className="input-dark w-full mt-1 px-3 py-2 text-xs font-mono"
+              spellCheck={false}
+            />
+          </div>
+        </div>
+      </div>
+
+      {/* Test connection */}
+      <div className="card-navy p-5">
+        <h2 className="text-xs font-bold tracking-widest text-amber-500 uppercase mb-1">
+          Test Connection
+        </h2>
+        <p className="text-xs text-slate-500 mb-4">
+          Pings Aurora with your configured API key. Does not cost credits.
+          Requires AURORA_API_KEY and AURORA_TENANT_ID env vars on this deployment.
+        </p>
+        <div className="flex items-center gap-3">
+          <button
+            onClick={handleTest}
+            disabled={testing}
+            className="btn-primary px-4 py-2 text-xs"
+          >
+            {testing ? "Testing…" : "Run test"}
+          </button>
+          {testResult && (
+            <div
+              className={`flex-1 px-3 py-2 rounded text-xs font-mono ${
+                testResult.ok
+                  ? "bg-green-600/15 text-green-300 border border-green-500/30"
+                  : "bg-red-600/15 text-red-300 border border-red-500/30"
+              }`}
+            >
+              {testResult.ok ? "✓" : "✗"}{" "}
+              {testResult.status ? `[${testResult.status}] ` : ""}
+              {testResult.message}
+              {!testResult.configured && (
+                <span className="block mt-1 text-amber-300">
+                  Add AURORA_API_KEY and AURORA_TENANT_ID in Vercel, then redeploy.
+                </span>
+              )}
+            </div>
+          )}
+        </div>
+      </div>
+
+      {/* Save bar */}
+      <div className="flex items-center justify-end gap-3 pt-2">
+        {saveStatus && (
+          <span className="text-xs text-slate-400">{saveStatus}</span>
+        )}
+        <button onClick={onSave} className="btn-primary px-5 py-2 text-xs">
+          Save Aurora settings
+        </button>
+      </div>
+    </div>
+  );
 }

@@ -18,10 +18,10 @@
 import { NextRequest, NextResponse } from "next/server";
 import { v4 as uuidv4 } from "uuid";
 import { waitUntil } from "@vercel/functions";
-import type { Intake, SundialSession } from "@/lib/types";
+import type { Intake, SundialSession, GateConfig } from "@/lib/types";
 import { evaluateGate } from "@/lib/gate";
 import { getGateConfig, setSession, updateSession, getTodaySpendUsd, getMonthSpendUsd } from "@/lib/store";
-import { runFullAuroraPipeline } from "@/lib/aurora-mock";
+import { runRoutedAuroraPipeline } from "@/lib/aurora-router";
 
 // The Aurora pipeline takes 5-15 seconds. The default Vercel function
 // timeout (10s on Hobby) will kill it mid-flight. Bump to the max allowed
@@ -81,11 +81,11 @@ export async function POST(req: NextRequest) {
       });
     }
 
-    // Gate passed — run Aurora pipeline in the background.
+    // Gate passed — run Aurora pipeline in the background through the
+    // router (real vs mock decision happens inside).
     // waitUntil keeps the serverless function alive after the response is
-    // sent until the promise settles, so the pipeline actually finishes
-    // instead of being killed when the response goes out.
-    waitUntil(runAuroraPipelineAsync(sessionId, body));
+    // sent until the promise settles.
+    waitUntil(runAuroraPipelineAsync(sessionId, body, gateConfig));
 
     return NextResponse.json({
       success: true,
@@ -113,14 +113,17 @@ export async function POST(req: NextRequest) {
  * TODO: In production, use a background job queue (e.g. Inngest, Trigger.dev)
  *       instead of a Promise fire-and-forget pattern.
  */
-async function runAuroraPipelineAsync(sessionId: string, intake: Intake) {
+async function runAuroraPipelineAsync(
+  sessionId: string,
+  intake: Intake,
+  gateConfig: GateConfig
+) {
   try {
-    const result = await runFullAuroraPipeline(
+    const result = await runRoutedAuroraPipeline(
       intake,
+      gateConfig,
       (status, message) => {
         // Fire-and-forget progress update — don't block the pipeline on DB writes.
-        // Errors here are non-fatal: the final updateSession call below records
-        // the terminal state.
         updateSession(sessionId, {
           status: status as SundialSession["status"],
           error_message: undefined,
@@ -131,7 +134,11 @@ async function runAuroraPipelineAsync(sessionId: string, intake: Intake) {
       }
     );
 
-    // Pipeline complete — update session with all results
+    console.log(
+      `[session ${sessionId}] Routing: ${result.mode} (${result.routing_reason}). Fallbacks: ${result.fallback_calls.join(", ") || "none"}`
+    );
+
+    // Pipeline complete — update session with all results + routing metadata
     await updateSession(sessionId, {
       aurora_project: result.project,
       aurora_design: result.design,
@@ -141,10 +148,13 @@ async function runAuroraPipelineAsync(sessionId: string, intake: Intake) {
       status: "complete",
       proposal_url: result.proposal.shareable_url,
       error_message: undefined,
+      aurora_mode: result.mode,
+      aurora_fallback_calls: result.fallback_calls,
     });
 
-    console.log(`[session ${sessionId}] Pipeline complete. Proposal: ${result.proposal.shareable_url}`);
-
+    console.log(
+      `[session ${sessionId}] Pipeline complete. Proposal: ${result.proposal.shareable_url}`
+    );
   } catch (err) {
     console.error(`[session ${sessionId}] Pipeline failed:`, err);
     await updateSession(sessionId, {

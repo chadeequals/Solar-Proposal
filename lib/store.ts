@@ -35,6 +35,8 @@ type SessionRow = {
   aurora_proposal: SundialSession["aurora_proposal"] | null;
   proposal_url: string | null;
   error_message: string | null;
+  aurora_mode: "mock" | "real" | "partial" | null;
+  aurora_fallback_calls: string[] | null;
   created_at: string;
   updated_at: string;
 };
@@ -53,6 +55,8 @@ function rowToSession(r: SessionRow): SundialSession {
     aurora_proposal: r.aurora_proposal ?? undefined,
     proposal_url: r.proposal_url ?? undefined,
     error_message: r.error_message ?? undefined,
+    aurora_mode: r.aurora_mode ?? "mock",
+    aurora_fallback_calls: r.aurora_fallback_calls ?? [],
     created_at: r.created_at,
     updated_at: r.updated_at,
   };
@@ -85,6 +89,8 @@ export async function setSession(session: SundialSession): Promise<void> {
     aurora_proposal: session.aurora_proposal ?? null,
     proposal_url: session.proposal_url ?? null,
     error_message: session.error_message ?? null,
+    aurora_mode: session.aurora_mode ?? "mock",
+    aurora_fallback_calls: session.aurora_fallback_calls ?? [],
     created_at: session.created_at,
     updated_at: session.updated_at,
   };
@@ -113,6 +119,8 @@ export async function updateSession(
     "aurora_proposal",
     "proposal_url",
     "error_message",
+    "aurora_mode",
+    "aurora_fallback_calls",
   ];
   for (const k of keys) {
     if (k in updates) allowed[k] = updates[k] ?? null;
@@ -171,6 +179,9 @@ type GateConfigRow = {
   fallback_action: GateConfig["fallback_action"];
   lender_pre_qual_required: boolean;
   rules: GateRule[];
+  aurora_real_enabled: boolean | null;
+  aurora_allow_list_emails: string[] | null;
+  aurora_allow_list_session_ids: string[] | null;
   updated_at: string;
   updated_by: string | null;
 };
@@ -185,6 +196,9 @@ function rowToGateConfig(r: GateConfigRow): GateConfig {
     fallback_action: r.fallback_action,
     lender_pre_qual_required: r.lender_pre_qual_required,
     rules: r.rules,
+    aurora_real_enabled: r.aurora_real_enabled ?? false,
+    aurora_allow_list_emails: r.aurora_allow_list_emails ?? [],
+    aurora_allow_list_session_ids: r.aurora_allow_list_session_ids ?? [],
     updated_at: r.updated_at,
   };
 }
@@ -223,6 +237,9 @@ export async function setGateConfig(config: GateConfig): Promise<GateConfig> {
     fallback_action: config.fallback_action,
     lender_pre_qual_required: config.lender_pre_qual_required,
     rules: config.rules,
+    aurora_real_enabled: config.aurora_real_enabled ?? false,
+    aurora_allow_list_emails: config.aurora_allow_list_emails ?? [],
+    aurora_allow_list_session_ids: config.aurora_allow_list_session_ids ?? [],
     updated_at: new Date().toISOString(),
     updated_by: "admin",
   };
@@ -249,6 +266,7 @@ type CreditUsageRow = {
   call_type: string;
   cost_usd: number;
   success: boolean;
+  mode: "mock" | "real" | null;
   request_payload: unknown;
   response_payload: unknown;
   timestamp: string;
@@ -261,6 +279,7 @@ function rowToCreditUsage(r: CreditUsageRow): CreditUsageEntry {
     call_type: r.call_type as CreditUsageEntry["call_type"],
     cost_usd: Number(r.cost_usd),
     success: r.success,
+    mode: r.mode ?? "mock",
     timestamp: r.timestamp,
   };
 }
@@ -273,6 +292,7 @@ export async function logCreditUsage(
     call_type: entry.call_type,
     cost_usd: entry.cost_usd,
     success: entry.success,
+    mode: entry.mode ?? "mock",
     request_payload: null,
     response_payload: null,
     timestamp: new Date().toISOString(),

@@ -181,6 +181,10 @@ export const DEFAULT_GATE_CONFIG: GateConfig = {
   daily_credit_cap_usd: 200,   // ~10 Aurora projects/day (conservative default)
   fallback_action: "lead_only",
   lender_pre_qual_required: false,
+  // Real Aurora is off by default — admin opts in per session via allow-list
+  aurora_real_enabled: false,
+  aurora_allow_list_emails: [],
+  aurora_allow_list_session_ids: [],
   updated_at: new Date().toISOString(),
   rules: [
     // ── State Eligibility ──────────────────────────────

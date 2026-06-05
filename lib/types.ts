@@ -108,6 +108,17 @@ export interface GateConfig {
   rules: GateRule[];
   fallback_action: FallbackAction; // What to do when gate fails
   lender_pre_qual_required: boolean; // Future: require financing pre-qual first
+
+  // ── Real-Aurora rollout controls ──────────────────────
+  // Master switch — if false, every session uses the mock client even if
+  // the allow-lists below match. If true, sessions matching an allow-list
+  // hit real Aurora; everything else still uses mock.
+  aurora_real_enabled: boolean;
+  // Emails (case-insensitive) and session IDs that should be routed to
+  // the real Aurora API. Empty arrays → nothing goes to real Aurora.
+  aurora_allow_list_emails: string[];
+  aurora_allow_list_session_ids: string[];
+
   updated_at?: string;     // ISO timestamp of last save
   updated_by?: string;     // Admin user who last saved (for future auth)
 }
@@ -228,6 +239,8 @@ export type AuroraApiCallType =
   | "get_financing"
   | "create_web_proposal";
 
+export type AuroraMode = "mock" | "real" | "partial";
+
 export interface CreditUsageEntry {
   id: string;
   session_id: string;
@@ -238,6 +251,7 @@ export interface CreditUsageEntry {
   design_id?: string;
   success: boolean;
   error?: string;
+  mode?: "mock" | "real";  // "partial" is session-level only
 }
 
 // ─────────────────────────────────────────────
@@ -267,6 +281,13 @@ export interface SundialSession {
   created_at: string;
   updated_at: string;
   error_message?: string;
+  // Tells the admin whether this session hit real Aurora, the mock
+  // client, or fell through partially. Populated by the router.
+  aurora_mode?: AuroraMode;
+  // Names of Aurora calls that fell back to mock for this session.
+  // e.g. ["ai_site_model"] means real Aurora was attempted but the
+  // AI site model call failed and mock filled in.
+  aurora_fallback_calls?: string[];
 }
 
 // ─────────────────────────────────────────────
