@@ -17,10 +17,16 @@
 
 import { NextRequest, NextResponse } from "next/server";
 import { v4 as uuidv4 } from "uuid";
+import { waitUntil } from "@vercel/functions";
 import type { Intake, SundialSession } from "@/lib/types";
 import { evaluateGate } from "@/lib/gate";
 import { getGateConfig, setSession, updateSession, getTodaySpendUsd, getMonthSpendUsd } from "@/lib/store";
 import { runFullAuroraPipeline } from "@/lib/aurora-mock";
+
+// The Aurora pipeline takes 5-15 seconds. The default Vercel function
+// timeout (10s on Hobby) will kill it mid-flight. Bump to the max allowed
+// on the current plan so waitUntil has time to finish.
+export const maxDuration = 60;
 
 export async function POST(req: NextRequest) {
   try {
@@ -75,10 +81,11 @@ export async function POST(req: NextRequest) {
       });
     }
 
-    // Gate passed — run Aurora pipeline asynchronously
-    // We fire and forget so the response returns immediately
-    // The client polls /api/intake/[sessionId]/status for updates
-    runAuroraPipelineAsync(sessionId, body);
+    // Gate passed — run Aurora pipeline in the background.
+    // waitUntil keeps the serverless function alive after the response is
+    // sent until the promise settles, so the pipeline actually finishes
+    // instead of being killed when the response goes out.
+    waitUntil(runAuroraPipelineAsync(sessionId, body));
 
     return NextResponse.json({
       success: true,
